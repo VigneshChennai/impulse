@@ -109,7 +109,7 @@ class SSH:
         t = threading.Thread(target=self.__read__)
         t.daemon = True
         t.start()
-        self.__run__("stty -echo")
+        __run__("stty -echo")
         return self
         
     def close(self):
