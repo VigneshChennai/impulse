@@ -18,56 +18,77 @@ signal.signal(signal.SIGINT, signal_handler)
 class SSH:
 
     def __init__(self, host, username, password):
-        
         self.host = host
         self.username = username
         self.password = password
         self.auto_input = True
         self.shell = "bash -s"
+        self.__begin__ = "%--BEGIN-23464238676542-BEGIN--%"
         self.__end__ = "%--END-23464238676542-END--%"
         self.__outbalance__ = ""
-        self.status = "0"
+        self.status = ""
         self.completion = threading.Event()
         self.inputs = Inputs(None)
         
         self.print_buffer = ""
         
         self.command_running = False
+        self.command_status = "notstarted"
+        #self.commandStatus = None
+        
+        self.last_line_answered = False
         
 
     def __command_running__(self):
         self.command_running = True
+        self.command_status = "running"
     
     def __command_completed__(self):
         self.command_running = False
+        self.command_status = "completed"
     
     def __print__(self, content):
-        if not self.command_running:
-            return
         pbuffer = []
+        sbuffer = ""
         for c in content:
-            if not self.command_running:
-                break
             d = self.__print_analyser__(c)
             if d:
                 pbuffer.append(d)
+            
         if len(pbuffer) > 0:
             sys.stdout.write("".join(pbuffer))
             sys.stdout.flush()
+            
 
     def __print_analyser__(self, content):
         pbuffer = self.print_buffer
-        if self.__end__.startswith(pbuffer + content):
-            if len(pbuffer + content) == len(self.__end__):
-                self.print_buffer = ""
-                self.__command_completed__()
-                return
+        if not self.command_running:
+            if ('\n' + self.__begin__).startswith(pbuffer + content):
+                if len(pbuffer + content) == len(self.__begin__) + 1:
+                    self.print_buffer = ""
+                    self.__command_running__()
+                else:
+                    self.print_buffer += content
             else:
-                self.print_buffer += content
+                if ('\n' + self.__begin__).startswith(content):
+                    self.print_buffer = content
+                else:
+                    self.print_buffer = ""
         else:
-            if len(pbuffer) != 0:
-                self.print_buffer = ""
-            return pbuffer + content
+            if self.__end__.startswith(pbuffer + content):
+                if len(pbuffer + content) == len(self.__end__):
+                    self.print_buffer = ""
+                    self.__command_completed__()
+                    self.completion.set()
+                    return
+                else:
+                    self.print_buffer += content
+            else:
+                if self.__end__.startswith(content):
+                    self.print_buffer = content
+                else:
+                    self.print_buffer = ""
+                return pbuffer + content
             
     def __handle_input__(self):
         while self.alive:
@@ -93,8 +114,6 @@ class SSH:
         self.client = client
         conn = self.client.get_transport().open_session()
         conn.get_pty()
-        #conn.set_combine_stderr(True)
-
         print "[local] Initializing shell"
         conn.exec_command(self.shell)
         self.stdin = conn.makefile("wb")
@@ -102,7 +121,7 @@ class SSH:
         self.conn = conn
 
         print "[local] Connected to host[%s]" % (self.host)
-        print "[local] Starting step execution .. .."
+        print "[local] Template execution started"
         t = threading.Thread(target=self.__handle_input__)
         t.daemon = True
         t.start()
@@ -114,7 +133,7 @@ class SSH:
         
     def close(self):
         self.alive = False
-        print "[local] Execution completed .. .."
+        print "[local] Template execution completed"
         self.stdin.close()
         self.stdout.close()
         self.conn.close()
@@ -128,8 +147,6 @@ class SSH:
             while self.alive and not self.stdout.channel.recv_ready():
                 time.sleep(0.3)
             data = self.stdout.channel.recv(10000)
-            #sys.stdout.write(data)
-            #sys.stdout.flush()
             self.__print__(data)
             if len(data) > 0:
                 self.__analyze__(data)           
@@ -138,10 +155,18 @@ class SSH:
         d = self.__outbalance__ + data
         status = False
         splitdata = d.split('\n')
+        if self.last_line_answered:
+            if len(splitdata) > 1:
+                self.last_line_answered = False
+                del splitdata[0]
+            else:
+                return
+        last_answered_line = 0
+        count = 0
         for line in splitdata:
+            count += 1
             line = line.strip()
             if status:
-                #print "**** END ****"
                 self.status = line
                 self.completion.set()
                 status = False
@@ -151,10 +176,15 @@ class SSH:
                 if self.inputs.cinput and self.auto_input:
                     answer = self.inputs.get_answer(line)
                     if answer:
+                        last_answered_line = count
+                        last_line_answer
                         self.stdin.write(answer)
                         self.stdin.flush()
-                        
-        self.__outbalance__ = splitdata[-1]
+        if len(splitdata) == last_answered_line:
+            self.last_line_answered = True
+        else:
+            self.last_line_answered = False
+            self.__outbalance__ = splitdata[-1]
                     
     def __wait_for_completion__(self, timeout=None):
         self.completion.clear()
@@ -185,7 +215,8 @@ class SSH:
     
     def __run__(self, command, inputs=None, rets=True):
         self.inputs = Inputs(inputs)
-        cmd = "%s;status=$?;echo;echo %s;echo $status;\n" %(
+        cmd = "echo;echo %s; %s;status=$?;echo;echo %s\"$status\";echo\n" %(
+                    self.__begin__,
                     command,
                     self.__end__
                     )
@@ -194,11 +225,10 @@ class SSH:
         self.__wait_for_completion__()
         
     def run(self, command, inputs=None, rets=True):
-        #self.command_running = True
-        self.__command_running__()
         print "[local] Executing: %s" % command
+        #self.commandStatus = CommandStatus(command)
+        #self.commandStatus.running()
         self.__run__(command, inputs=None, rets=True)
-        
         print "[local] Command executed"
         if not self.status in ["0", ""]:
             raise RuntimeError("Command execution returned status <%s>" %(
@@ -236,6 +266,17 @@ class SSH:
                 sftp.close()
             except:
                 pass
+
+class CommandStatus:
+    def __init__(command):
+        self.command = command
+        self.running = False
+        
+    def isRunning():
+        return self.running
+    def running():
+        self.running = True
+
 
 class Input:
     def __init__(self, question, answer, optional=False, atlast="\n"):
@@ -276,5 +317,6 @@ class Inputs:
                 return None
             else:
                 return None
+
 
 
