@@ -1,8 +1,0 @@
-import impulse
-import time
-
-with impulse.SSH('localhost', 'vignesh', 'borntowin') as conn:
-    time.sleep(5)
-    conn.run("ls")
-    conn.run("echo Hello vignesh")
-    
