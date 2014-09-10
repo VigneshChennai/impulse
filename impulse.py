@@ -11,6 +11,7 @@ import signal
 import Queue
 import copy
 import random
+import math
 
 #Handler for keyboard interrupt signal
 #upon recieving the keyboard interrupt signal,
@@ -104,17 +105,31 @@ class SSH:
     def run(self, command, inputs=None, rets=True):
         return self.cem.run(command, inputs)
 
+    def __transfer_callback__(self, transferred, total):
+        p_eq = math.floor((float(transferred)/float(total)) * 50)
+        p_sp = 50 - p_eq
+        out = "["
+        for s in range(0, int(p_eq)):
+            out += "="
+        
+        for s in range(0, int(p_sp)):
+            out += " "
+        out += "]"
+        sys.stdout.write("\rProgress : %s" % (out))
+        sys.stdout.flush()
+    
     #get method is used to get a remote file to the local system
     def get(self, remote, local):
         sftp = self.client.open_sftp()
         try:
             print "[local] Copying file from [%s]%s to [%s]%s" %(self.host, remote, "local", local)
-            sftp.get(remote, local)
-            print "[local] Copied successfully"
+            sftp.get(remote, local, callback=self.__transfer_callback__)
+            print "\n[local] Copied successfully"
         except:
             error = traceback.format_exc()
             print error
-            print "[local] Copy failed"    
+            print "[local] Copy failed"  
+            raise Exception("File copy failed")  
         finally:
             try:
                 sftp.close()
@@ -126,11 +141,12 @@ class SSH:
         sftp = self.client.open_sftp()
         try:
             print "[local] Copying file from [%s]%s to [%s]%s" %("local", local, self.host, remote)
-            sftp.put(local, remote)
-            print "[local] Copied successfully"
+            sftp.put(local, remote, callback=self.__transfer_callback__)
+            print "\n[local] Copied successfully"
         except:
             error = traceback.format_exc()
             print error
+            raise Exception("File copy failed")
             print "[local] Copy failed"
         finally:
             try:
@@ -219,14 +235,7 @@ class BufferEntry:
     
     def __init__(self):
         self.line = ""
-        self.processed = False
         self.answered = False
-    
-    def is_processed(self):
-        return processed
-        
-    def set_processed(self, processed = True):
-        self.processed = processed
 
     def is_answered(self):
         return self.answered
@@ -277,7 +286,7 @@ class CommandExecutionAndMonitoring:
         self.__input__(cmd)
         if wait:
             self.__wait_for_completion__()
-            print "\r               "
+            print "\r                                                          "
             print "[local] Command executed"
             if not self.exit_code in ["0", ""]:
                 raise RuntimeError("Command execution returned status <%s>" %(
@@ -368,6 +377,7 @@ class CommandExecutionAndMonitoring:
                 if self.inputs.cinput and self.auto_input:
                     answer = self.inputs.get_answer(entry.get_line())
                     if answer:
+                        entry.set_answered()
                         return answer
     
     def __print_analyzer__(self, character):
