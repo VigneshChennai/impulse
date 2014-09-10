@@ -8,6 +8,10 @@ import threading
 import select
 import time
 import signal
+import Queue
+import copy
+import random
+import math
 
 #Handler for keyboard interrupt signal
 #upon recieving the keyboard interrupt signal,
@@ -29,117 +33,8 @@ class SSH:
         self.username = username
         self.password = password
         self.port = port
-        self.auto_input = True
-        self.shell = "bash -s"
-        self.__begin__ = "%--BEGIN-23464238676542-BEGIN--%"
-        self.__end__ = "%--END-23464238676542-END--%"
-        self.__outbalance__ = ""
-        self.status = ""
-        self.completion = threading.Event()
-        self.inputs = Inputs(None)
+        self.shell = "bash -s"        
         
-        self.print_buffer = ""
-        
-        self.command_running = False
-        self.command_status = "notstarted"
-        
-        self.last_line_answered = False
-        
-    #This method is executed when a new command started executing
-    def __command_running__(self):
-        self.command_running = True
-        self.command_status = "running"
-    
-    #This method is executed when a commands exits/terminates
-    def __command_completed__(self):
-        self.command_running = False
-        self.command_status = "completed"
-    
-    #Prints the output of the command after analysing
-    def __print__(self, content):
-        pbuffer = []
-        sbuffer = ""
-        for c in content:
-            #sending each character of command output to 
-            #__print_analyser__ for analysing whether it needs to be
-            #printed to screen or not.
-            #
-            #It return None if nothing need to printed
-            #else returns the characters need to printed.
-            d = self.__print_analyser__(c)
-            if d:
-                pbuffer.append(d)
-        
-        #printing the content if the pbuffer has content
-        if len(pbuffer) > 0:
-            sys.stdout.write("".join(pbuffer))
-            sys.stdout.flush()
-            
-
-    #This method used to check whether to print command output to screen or not
-    #It does it by analysing the output from remote server and identifies if a command
-    #starts or exits
-    #
-    #It will return contents only when the command is running
-    #else None will be returned
-    def __print_analyser__(self, content):
-        pbuffer = self.print_buffer
-        #sys.stdout.write(content)
-        #sys.stdout.flush()
-        if not self.command_running:
-            #This section of code analyse whether any command is started executing.
-            #if it founds any, then it will call the __command_running__() function
-            if ('\n' + self.__begin__).startswith(pbuffer + content):
-                if len(pbuffer + content) == len(self.__begin__) + 1:
-                    self.print_buffer = ""
-                    self.__command_running__()
-                else:
-                    self.print_buffer += content
-            else:
-                if ('\n' + self.__begin__).startswith(content):
-                    self.print_buffer = content
-                else:
-                    self.print_buffer = ""
-        else:
-            #This section of code analyse whether any command has finished execution.
-            #if it founds any, the it will call the __command_completed__()
-            if self.__end__.startswith(pbuffer + content):
-                if len(pbuffer + content) == len(self.__end__):
-                    self.print_buffer = ""
-                    self.__command_completed__()
-                    return
-                else:
-                    self.print_buffer += content
-            else:
-                if self.__end__.startswith(content):
-                    self.print_buffer = content
-                else:
-                    self.print_buffer = ""
-                return pbuffer + content
-    
-    #__handle_input__ method is used to check for inputs provided by user from the console.
-    #Instead of blocking IO, it uses 'select' to perform asynchronous IO on the console input.       
-    def __handle_input__(self):
-        while self.alive:
-            i, o, e = select.select( [sys.stdin], [], [], 1)
-            if i:
-                line = sys.stdin.readline().strip()
-            else:
-                continue
-            #If any manual input received from the user, the below code will disable the
-            #further automatic input from the script
-            if self.auto_input:
-                print "[local] Manual entry received." \
-                        " Auto inputs will be disabled" \
-                        " for the current running command"
-                self.auto_input = False
-            #Typing "__exit__" in the console will kill the script execution and terminated the 
-            #script
-            if line.strip() == "__exit__":
-                self.close()
-                sys.exit(1)
-            self.stdin.write(line+"\n")
-    
     #This method connects to remote server based on the details 
     #initialized by the  __init__ method
     def __enter__(self):
@@ -161,18 +56,23 @@ class SSH:
         print "[local] Connected to host[%s]" % (self.host)
         print "[local] Template execution started"
 
-        #Creating a new daemon thread to handle inputs for user
-        t = threading.Thread(target=self.__handle_input__)
-        t.daemon = True
-        t.start()
-        
         #Creating a new daemon thread to process output from 
         #command executed in the remote server
         t = threading.Thread(target=self.__read__)
         t.daemon = True
         t.start()
-        #disable the echo in pty mode
-        #self.__run__("stty -echo")
+        self.cem = CommandExecutionAndMonitoring(self.host)
+        
+        def __input__(data):
+            self.stdin.write(data)
+            self.stdin.flush()
+        
+        def __output__(data):
+            sys.stdout.write(data)
+            sys.stdout.flush()
+        self.cem.add_input_listener(__input__)
+        self.cem.add_output_listener(__output__)
+        
         return self
 
     #close method is used to close all the connections to the remote server on 
@@ -195,123 +95,41 @@ class SSH:
             while self.alive and not self.stdout.channel.recv_ready():
                 time.sleep(0.3)
             data = self.stdout.channel.recv(10000)
-            self.__print__(data)
-            if len(data) > 0:
-                self.__analyze__(data)           
-    
-    #__analyze__ method is responsible for checking the end of command execution
-    #and trigger completed signal
-    #
-    #It is also responsible for automatica input mechanism            
-    def __analyze__(self, data):
-        d = self.__outbalance__ + data
-        status = False
-        splitdata = d.split('\n')
-        if self.last_line_answered:
-            if len(splitdata) > 1:
-                self.last_line_answered = False
-                del splitdata[0]
-            else:
-                return
-        last_answered_line = 0
-        count = 0
-        #analysing each row
-        for line in splitdata:
-            count += 1
-            line = line.strip()
-            if status:
-                self.status = line
-                #emitting completion signal
-                self.completion.set()
-                status = False
-            elif line == self.__end__:
-                status = True
-            else:
-                if self.inputs.cinput and self.auto_input:
-                    answer = self.inputs.get_answer(line)
-                    if answer:
-                        last_answered_line = count
-                        self.stdin.write(answer)
-                        self.stdin.flush()
-        #Analysing whether last line answer or not
-        if len(splitdata) == last_answered_line:
-            self.last_line_answered = True
-        else:
-            self.last_line_answered = False
-            self.__outbalance__ = splitdata[-1]
-    
-    #This method block the thread which call this method 
-    #until it receives a command completion signal
-    #
-    #It also supports timer
-    def __wait_for_completion__(self, timeout=None):
-        self.completion.clear()
-        if timeout:
-            self.completion.wait(timeout)
-            return self.completion.is_set()
-        else:
-            while True:
-                self.completion.wait(1)
-                if self.completion.is_set():
-                    break
-    
-    #Switching the user using sudoo
-    #Sudo command should not be used with run method.
-    #Required sudo functionality can be achieved by calling this method
-    def sudo(self, user, password):
-        class Sudo:
-            def __init__(self, ssh):
-                self.ssh = ssh
-            def __enter__(self):
-                return self
-            def __exit__(self,  type, value, traceback):
-                self.ssh.stdin.write("exit\n")
-        print "[local] Executing sudo"
-        self.inputs = Inputs(Input(".*assword",password))
-        self.stdin.write("echo;echo %s;sudo -S -k -u '%s' -i "
-                        "bash -c \"echo;echo '%s';echo 0;bash --login\"\n" 
-                        %(self.__begin__,user,self.__end__))
-        if not self.__wait_for_completion__(5):
-            raise RuntimeError("Executing sudo is not successful")
-        return Sudo(self)
-    
-    #__run__ is method which actually invokes the command in the remote server
-    def __run__(self, command, inputs=None, rets=True):
-        self.auto_input = True
-        self.inputs = Inputs(inputs)
-        cmd = "echo;echo %s; %s;status=$?;echo;echo %s;echo \"$status\";echo\n" %(
-                    self.__begin__,
-                    command,
-                    self.__end__
-                    )
-        self.stdin.write(cmd)
-        self.stdin.flush()
-        self.__wait_for_completion__()
+            self.cem.analyze(data)
 
+    def sudo(self, user, password):
+        return self.cem.sudo(user, password)
+    
     #This method runs the command and check it's 
     #exit status whether is completed successfully.
     def run(self, command, inputs=None, rets=True):
-        print "[local] Executing: %s" % command
-        #self.commandStatus = CommandStatus(command)
-        #self.commandStatus.running()
-        self.__run__(command, inputs, rets)
-        print "[local] Command executed"
-        if not self.status in ["0", ""]:
-            raise RuntimeError("Command execution returned status <%s>" %(
-                                str(self.status)
-                                ))
+        return self.cem.run(command, inputs)
 
+    def __transfer_callback__(self, transferred, total):
+        p_eq = math.floor((float(transferred)/float(total)) * 50)
+        p_sp = 50 - p_eq
+        out = "["
+        for s in range(0, int(p_eq)):
+            out += "="
+        
+        for s in range(0, int(p_sp)):
+            out += " "
+        out += "]"
+        sys.stdout.write("\rProgress : %s" % (out))
+        sys.stdout.flush()
+    
     #get method is used to get a remote file to the local system
     def get(self, remote, local):
         sftp = self.client.open_sftp()
         try:
             print "[local] Copying file from [%s]%s to [%s]%s" %(self.host, remote, "local", local)
-            sftp.get(remote, local)
-            print "[local] Copied successfully"
+            sftp.get(remote, local, callback=self.__transfer_callback__)
+            print "\n[local] Copied successfully"
         except:
             error = traceback.format_exc()
             print error
-            print "[local] Copy failed"    
+            print "[local] Copy failed"  
+            raise Exception("File copy failed")  
         finally:
             try:
                 sftp.close()
@@ -323,11 +141,12 @@ class SSH:
         sftp = self.client.open_sftp()
         try:
             print "[local] Copying file from [%s]%s to [%s]%s" %("local", local, self.host, remote)
-            sftp.put(local, remote)
-            print "[local] Copied successfully"
+            sftp.put(local, remote, callback=self.__transfer_callback__)
+            print "\n[local] Copied successfully"
         except:
             error = traceback.format_exc()
             print error
+            raise Exception("File copy failed")
             print "[local] Copy failed"
         finally:
             try:
@@ -335,19 +154,8 @@ class SSH:
             except:
                 pass
 
-#Instance of CommandStatus class is used to store the 
-#current status in command execution in SSH class
-class CommandStatus:
-    def __init__(command):
-        self.command = command
-        self.running = False
-        
-    def isRunning():
-        return self.running
-    def running():
-        self.running = True
 
-#Input calss is used to store question and corresponding answer
+#Input class is used to store question and corresponding answer
 #which need to be provide to the command during execution.
 class Input:
     def __init__(self, question, answer, optional=False, atlast="\n"):
@@ -393,6 +201,244 @@ class Inputs:
                 return None
             else:
                 return None
+                
+class Buffer:
+    
+    def __init__(self):
+        self.buffer_entry = Queue.Queue()
+        self.current_entry = BufferEntry()
+        self.lock = threading.Lock()
+    
+    def add_character(self, character):
+        with self.lock:
+            if character == '\n':
+                self.buffer_entry.put(self.current_entry)
+                self.current_entry = BufferEntry()
+            else:
+                self.current_entry.add_character(character)
+    
+    def get_entry(self):
+        try:
+            return self.buffer_entry.get(False)
+        except:
+            with self.lock:
+                local_copy = copy.deepcopy(self.current_entry)
+            return local_copy
+    
+    def clear():
+        with self.buffer_entry.mutex:
+            self.buffer_enty.queue.clear()
+        with lock:
+            self.current_entry = BufferEntry()
+    
+class BufferEntry:
+    
+    def __init__(self):
+        self.line = ""
+        self.answered = False
 
+    def is_answered(self):
+        return self.answered
+    
+    def set_answered(self, answered = True):
+        self.answered = answered
+        
+    def get_line(self):
+        return self.line
+    
+    def add_character(self, character):
+        self.line += character
 
+class CommandExecutionAndMonitoring:
+    def __init__(self, host):
+        self.host = host
+        self.auto_input = True
+        self.__begin__ = "@--BEGIN-%s--@" % (random.random())
+        self.__end__ = "@--END-%s-END--@" % (random.random())
+        self.status = "notrunning"
+        self.exit_code = ""
+        self.completion = threading.Event()
+        self.__print_buffer__ = ""
+        self.buffer = Buffer()
+        self.inputs = Inputs(None)
+        
+        t = threading.Thread(target=self.__user_inputs_analyzer__)
+        t.daemon = True
+        t.start()
+        
+        self.input_listeners = []
+        self.output_listeners = []
+        
+    def run(self, command, inputs, wait = True):
+        if self.status != "completed" and self.status != "notrunning":
+            raise Exception("Cannot execute a command while "\
+                            "another command is running")
+        self.status = "ready"
+        self.inputs = Inputs(inputs)
+        self.auto_input = True
+        
+        cmd = "echo;echo %s; %s;status=$?;echo \"%s$status\"\n" %(
+                    self.__begin__,
+                    command,
+                    self.__end__
+                    )
+        print "\n[local] Executing %s" % (command)
+        self.__input__(cmd)
+        if wait:
+            self.__wait_for_completion__()
+            print "\r                                                          "
+            print "[local] Command executed"
+            if not self.exit_code in ["0", ""]:
+                raise RuntimeError("Command execution returned status <%s>" %(
+                                    str(self.exit_code)
+                                    ))
+            return self.exit_code
+        
+    def sudo(self, user, password):
+        class Sudo:
+            def __init__(self, cem):
+                self.cem = cem
+            def __enter__(self):
+                self.cem.status = "ready"
+                self.cem.auto_input = True
+                self.cem.inputs = Inputs(Input(".*assword",password))
+                self.cem.__input__("echo;echo %s;sudo -S -k -u '%s' -i "
+                                "bash -c \"echo;echo '%s'0;bash --login\"\n" 
+                                %(self.cem.__begin__,user,self.cem.__end__))
+                if not self.cem.__wait_for_completion__(5):
+                    raise RuntimeError("Executing sudo is not successful")
+                print "\r[Local] sudo successfull"
+                return self
+            def __exit__(self,  type, value, traceback):
+                self.cem.__input__("exit\n")
+                print "[Local] sudo command completed"
+        print "[local] Executing sudo"
+        
+        return Sudo(self)
+        
+    def analyze(self, data):
+        out = []
+        ans = []
+        for c in data:
+            if self.status == "running":
+                answer = self.__input_analyzer__(c)
+                if answer:
+                    ans.append(answer)
+            o = self.__print_analyzer__(c)
+            if o:
+                if o == '\n':
+                    o = '\n[%s] ' % (self.host)
+                out.append(o)
+        if len(out) > 0:
+            self.__output__("".join(out))
+            
+        if len(ans) > 0:    
+            for a in ans:
+                self.__input__(a)
+
+    def add_output_listener(self, listener):
+        self.output_listeners.append(listener)
+        
+    def add_input_listener(self, listener):
+        self.input_listeners.append(listener)
+        
+    def __output__(self, data):
+        for listener in self.output_listeners:
+            listener(data)
+        
+    def __input__(self, data):
+        for listener in self.input_listeners:
+            listener(data)
+        
+    def __answers__(self, data):
+        self.__input__(data)
+        
+    def __command_status__(self, status):
+        if status == "completed":
+            self.completion.set()
+        self.status = status
+
+    
+    def __wait_for_completion__(self, timeout=None):
+        self.completion.clear()
+        if timeout:
+            self.completion.wait(timeout)
+            return self.completion.is_set()
+        else:
+            while True:
+                self.completion.wait(1)
+                if self.completion.is_set():
+                    break
+                
+    def __input_analyzer__(self, character):
+            self.buffer.add_character(character)
+            entry = self.buffer.get_entry()
+            if not entry.is_answered():
+                if self.inputs.cinput and self.auto_input:
+                    answer = self.inputs.get_answer(entry.get_line())
+                    if answer:
+                        entry.set_answered()
+                        return answer
+    
+    def __print_analyzer__(self, character):
+        pbuffer = self.__print_buffer__
+
+        if self.status == "ready":
+            #This section of code analyse whether any command is started executing.
+            #if it founds any, then it will call the __command_running__() function
+            
+            if ('\n' + self.__begin__).startswith(pbuffer + character):
+                if len(pbuffer + character) == len(self.__begin__) + 1:
+                    self.__print_buffer__ = ""
+                    self.__command_status__("running")
+                else:
+                    self.__print_buffer__ += character
+            else:
+                if ('\n' + self.__begin__).startswith(character):
+                    self.__print_buffer__ = character
+                else:
+                    self.__print_buffer__ = ""
+        elif self.status == "running":
+            #This section of code analyse whether any command has finished execution.
+            #if it founds any, the it will call the __command_completed__()
+            if self.__end__.startswith(pbuffer + character):
+                if len(pbuffer + character) == len(self.__end__):
+                    self.__print_buffer__ = ""
+                    self.__command_status__("reaping")
+                    return
+                else:
+                    self.__print_buffer__ += character
+            else:
+                if self.__end__.startswith(character):
+                    self.__print_buffer__ = character
+                else:
+                    self.__print_buffer__ = ""
+                return pbuffer + character
+        elif self.status == "reaping":
+            if character == '\n' or character == '\r':
+                self.exit_code = self.__print_buffer__
+                self.__command_status__("completed")
+            else:
+                self.__print_buffer__ += character
+
+    def __user_inputs_analyzer__(self):
+        while True:
+            i, o, e = select.select( [sys.stdin], [], [], 1)
+            if i:
+                line = sys.stdin.readline().strip()
+            else:
+                continue
+            #If any manual input received from the user, 
+            #the below code will disable the
+            #further automatic input from the script for the current command
+            if self.auto_input:
+                print "[local] Manual entry received." \
+                        " Auto inputs will be disabled" \
+                        " for the current running command"
+                self.auto_input = False
+
+            self.__answers__(line + "\n")
+    
+
+        
 
